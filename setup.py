@@ -128,7 +128,6 @@ _deps = [
     "ipadic>=1.0.0,<2.0",
     "isort>=5.5.4",
     "jax>=0.2.8,!=0.3.2,<=0.3.6",
-    "jaxlib>=0.1.65,<=0.3.6",
     "jieba",
     "kenlm",
     "keras-nlp>=0.3.1",
@@ -268,7 +267,7 @@ if os.name == "nt":  # windows
     extras["flax"] = []  # jax is not supported on windows
 else:
     extras["retrieval"] = deps_list("faiss-cpu", "datasets")
-    extras["flax"] = deps_list("jax", "jaxlib", "flax", "optax")
+    extras["flax"] = deps_list("jax", "flax", "optax")
 
 extras["tokenizers"] = deps_list("tokenizers")
 extras["ftfy"] = deps_list("ftfy")
