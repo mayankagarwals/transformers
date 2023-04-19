@@ -388,6 +388,18 @@ class TFNoRepeatNGramLogitsProcessor(TFLogitsProcessor):
     Args:
         ngram_size (`int`):
             All ngrams of size `ngram_size` can only occur once.
+
+    Code might look complicated but is quite simple. The idea is to move from using pythonic structures like maps to tensors
+    that can be xla accelerated.
+
+    It's done by having a transition tensor as described.
+    hypthesis 0 -> [a b c ()]
+    banned token for a b c is made by
+    transition_tensor[0][0][a][b] * transition_tensor[0][1][b][c]* transition_tensor[1][2][c] (all vacabs)
+
+    ToDo
+    a. why are we getting segfault
+    b. why the memory footprint
     """
 
     def __init__(self, ngram_size: int):
