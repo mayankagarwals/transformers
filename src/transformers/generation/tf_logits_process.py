@@ -425,6 +425,27 @@ class TFNoRepeatNGramLogitsProcessor(TFLogitsProcessor):
         if not tf.executing_eagerly():
             raise NotImplementedError("TFNoRepeatNGramLogitsProcessor is only implemented for eager execution.")
 
+        '''
+                input_ids: [5, 50] (padded)
+                scores: [5, 50257], batch_size = 5, vocab_size = 50257
+                cur_len: 7
+                
+                generated_ngrams stores 
+                prev_input_ids: [5,7] the generated input_ids for each beam
+                
+                for each hypothesis: 
+                    get generated tokens - list of 7
+                    
+                    get generated ngrams
+                        all tuples of 2-grams : list of 6
+                        [(40, 2883), (2883, 6155), (6155, 351), (351, 616), (616, 13779), (13779, 3290)] for [40, 2883, 6155, 351, 616, 13779, 3290]
+                        map against already generated n-grams n-1: last token 
+                
+                    for n-1 tokens at end of current hypothesis, find all tokens that have been produced already 
+                
+                    
+                
+        '''
         batch_size, vocab_size = scores.shape
         banned_tokens = self.calc_banned_ngram_tokens(input_ids, batch_size, cur_len)
 
