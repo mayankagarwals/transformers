@@ -450,7 +450,7 @@ class TFNoRepeatNGramLogitsProcessor(TFLogitsProcessor):
         banned_tokens = self.calc_banned_ngram_tokens(input_ids, batch_size, cur_len)
 
         # create banned_tokens boolean mask
-        banned_tokens_indices_mask = []
+        banned_tokens_indices_mask = [] # 5x50257 , true where banned
         for banned_tokens_slice in banned_tokens:
             banned_tokens_indices_mask.append(
                 [True if token in banned_tokens_slice else False for token in range(vocab_size)]
