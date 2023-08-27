@@ -85,7 +85,7 @@ class TFAttention(tf.keras.layers.Layer):
             self.c_attn = TFConv1D(n_state * 2, nx, initializer_range=config.initializer_range, name="c_attn")
             self.q_attn = TFConv1D(n_state, nx, initializer_range=config.initializer_range, name="q_attn")
         else:
-            self.c_attn = TFConv1D(n_state * 3, nx, initializer_range=config.initializer_range, name="c_attn")
+            self.c_attn = TFConv1D(n_state * 3, nx, initializer_range=config.initializer_range, name="c_attn") #*3 for q,k,v
 
         self.c_proj = TFConv1D(n_state, nx, initializer_range=config.initializer_range, name="c_proj")
         self.attn_dropout = tf.keras.layers.Dropout(config.attn_pdrop)
@@ -196,10 +196,10 @@ class TFAttention(tf.keras.layers.Layer):
         a = attn_outputs[0]
 
         a = self.merge_heads(a)
-        a = self.c_proj(a)
+        a = self.c_proj(a) # feed forward network to "think" over the attended input
         a = self.resid_dropout(a, training=training)
 
-        outputs = [a, present] + attn_outputs[1:]
+        outputs = [a, present] + attn_outputs[1:] # present is key and value
         return outputs  # a, present, (attentions)
 
 
@@ -317,7 +317,7 @@ class TFGPT2MainLayer(tf.keras.layers.Layer):
 
         self.wte = TFSharedEmbeddings(
             config.vocab_size, config.hidden_size, initializer_range=config.initializer_range, name="wte"
-        )
+        ) # vocab_size = 50257, hidden_size = 768, total parameters = 38,603,776 (38.6M, product of 50257 and 768). confirmed through self.wte.count_params()
         self.drop = tf.keras.layers.Dropout(config.embd_pdrop)
         self.h = [TFBlock(config, scale=True, name=f"h_._{i}") for i in range(config.n_layer)]
         self.ln_f = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_epsilon, name="ln_f")
@@ -328,7 +328,7 @@ class TFGPT2MainLayer(tf.keras.layers.Layer):
                 name="embeddings",
                 shape=[self.n_positions, self.n_embd],
                 initializer=get_initializer(self.initializer_range),
-            )
+            ) # shape = [1024, 768]. 1024 is max length of input sequence. 768 is hidden size. total parameters = 786,432 (786K, product of 1024 and 768)
 
         super().build(input_shape)
 
@@ -366,7 +366,7 @@ class TFGPT2MainLayer(tf.keras.layers.Layer):
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
-            input_shape = shape_list(input_ids)
+            input_shape = shape_list(input_ids) # [1,7]
             input_ids = tf.reshape(input_ids, [-1, input_shape[-1]])
         elif inputs_embeds is not None:
             input_shape = shape_list(inputs_embeds)[:-1]
@@ -375,7 +375,7 @@ class TFGPT2MainLayer(tf.keras.layers.Layer):
 
         if past_key_values is None:
             past_length = 0
-            past_key_values = [None] * len(self.h)
+            past_key_values = [None] * len(self.h) # [None, None, None, None, None, None, None, None, None, None, None, None]
         else:
             past_length = shape_list(past_key_values[0][0])[-2]
 
@@ -389,7 +389,7 @@ class TFGPT2MainLayer(tf.keras.layers.Layer):
             # this attention mask is more simple than the triangular masking of causal attention
             # used in OpenAI GPT, we just need to prepare the broadcast dimension here.
             attention_mask_shape = shape_list(attention_mask)
-            attention_mask = tf.reshape(attention_mask, (attention_mask_shape[0], 1, 1, attention_mask_shape[1]))
+            attention_mask = tf.reshape(attention_mask, (attention_mask_shape[0], 1, 1, attention_mask_shape[1])) # tf.Tensor([[[[1 1 1 1 1 1 1]]]], shape=(1, 1, 1, 7), dtype=int32)
 
             # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
             # masked positions, this operation will create a tensor which is 0.0 for
@@ -398,7 +398,7 @@ class TFGPT2MainLayer(tf.keras.layers.Layer):
             # effectively the same as removing these entirely.
             one_cst = tf.constant(1.0)
             attention_mask = tf.cast(attention_mask, dtype=one_cst.dtype)
-            attention_mask = tf.multiply(tf.subtract(one_cst, attention_mask), tf.constant(-10000.0))
+            attention_mask = tf.multiply(tf.subtract(one_cst, attention_mask), tf.constant(-10000.0)) # equivalent to making the positions we don't want to attent -inf. Refer nano gpt attention mask
 
         # Copied from `modeling_tf_t5.py` with -1e9 -> -10000
         if self.config.add_cross_attention and encoder_attention_mask is not None:
@@ -431,10 +431,10 @@ class TFGPT2MainLayer(tf.keras.layers.Layer):
         if head_mask is not None:
             raise NotImplementedError
         else:
-            head_mask = [None] * self.num_hidden_layers
+            head_mask = [None] * self.num_hidden_layers # [None, None, None, None, None, None, None, None, None, None, None, None]
             # head_mask = tf.constant([0] * self.num_hidden_layers)
 
-        position_ids = tf.reshape(position_ids, [-1, shape_list(position_ids)[-1]])
+        position_ids = tf.reshape(position_ids, [-1, shape_list(position_ids)[-1]]) # tf.Tensor([[0 1 2 3 4 5 6]], shape=(1, 7), dtype=int32)
 
         if inputs_embeds is None:
             # Note: tf.gather, on which the embedding layer is based, won't check positive out of bound
@@ -447,10 +447,10 @@ class TFGPT2MainLayer(tf.keras.layers.Layer):
                     f" {tf.math.reduce_max(input_ids)} >= {self.config.vocab_size})"
                 ),
             )
-            inputs_embeds = self.wte(input_ids, mode="embedding")
+            inputs_embeds = self.wte(input_ids, mode="embedding") # shape (1,7,768) . n_embed is 768. Embedding is trained with back propogation
 
-        position_embeds = tf.gather(self.wpe, position_ids)
-
+        position_embeds = tf.gather(self.wpe, position_ids) # note how add_weight is used to add learnable parameters.
+# simple embedding matrix that maps positions to learnable embeddings
         if token_type_ids is not None:
             token_type_ids = tf.reshape(token_type_ids, [-1, shape_list(token_type_ids)[-1]])
             token_type_embeds = self.wte(token_type_ids, mode="embedding")
@@ -459,16 +459,16 @@ class TFGPT2MainLayer(tf.keras.layers.Layer):
 
         position_embeds = tf.cast(position_embeds, dtype=inputs_embeds.dtype)
         token_type_embeds = tf.cast(token_type_embeds, dtype=inputs_embeds.dtype)
-        hidden_states = inputs_embeds + position_embeds + token_type_embeds
-        hidden_states = self.drop(hidden_states, training=training)
+        hidden_states = inputs_embeds + position_embeds + token_type_embeds # [1,7,768]. Params; self.wte.count_params() + (1024*768) == self.count_params()
+        hidden_states = self.drop(hidden_states, training=training) # randomly set some activations to zero simulating a network with some neurons missing. This is done to prevent overfitting. Need to read up more on intuition
 
-        output_shape = input_shape + [shape_list(hidden_states)[-1]]
+        output_shape = input_shape + [shape_list(hidden_states)[-1]] # [1,7,768]. weights for embedding and decoding layer are shared. so same embedding size
 
         presents = () if use_cache else None
         all_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         all_hidden_states = () if output_hidden_states else None
-        for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
+        for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)): # self.h = 12 . These are sequentially placed heads in the transformer
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (tf.reshape(hidden_states, output_shape),)
 
@@ -486,7 +486,7 @@ class TFGPT2MainLayer(tf.keras.layers.Layer):
 
             hidden_states, present = outputs[:2]
             if use_cache:
-                presents = presents + (present,)
+                presents = presents + (present,) # accumulating all keys and queries for each layer
 
             if output_attentions:
                 all_attentions = all_attentions + (outputs[2],)
@@ -830,11 +830,11 @@ class TFGPT2LMHeadModel(TFGPT2PreTrainedModel, TFCausalLanguageModelingLoss):
             if token_type_ids is not None:
                 token_type_ids = tf.expand_dims(token_type_ids[:, -1], -1)
 
-        position_ids = kwargs.get("position_ids", None)
-        attention_mask = kwargs.get("attention_mask", None)
+        position_ids = kwargs.get("position_ids", None) # None
+        attention_mask = kwargs.get("attention_mask", None) # tf.Tensor([[1 1 1 1 1 1 1]], shape=(1, 7), dtype=int32)
 
         if attention_mask is not None and position_ids is None:
-            position_ids = tf.math.cumsum(attention_mask, axis=-1, exclusive=True)
+            position_ids = tf.math.cumsum(attention_mask, axis=-1, exclusive=True) # tf.Tensor([[0 1 2 3 4 5 6]], shape=(1, 7), dtype=int32)
             if past_key_values:
                 position_ids = tf.expand_dims(position_ids[:, -1], -1)
 

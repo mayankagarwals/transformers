@@ -804,21 +804,25 @@ class TFGenerationMixin:
         inputs_tensor, model_input_name, model_kwargs = self._prepare_model_inputs(
             inputs, generation_config.bos_token_id, model_kwargs
         )
+        '''
+        input_tensor: shape (1,7) -> (batch_size, seq_len)
+        '''
+
         # inputs_ids now has to be defined and cannot be None anymore
-        batch_size = shape_list(inputs_tensor)[0]
+        batch_size = shape_list(inputs_tensor)[0] # 1
 
         # 5. Prepare other model kwargs
-        model_kwargs["output_attentions"] = generation_config.output_attentions
-        model_kwargs["output_hidden_states"] = generation_config.output_hidden_states
-        model_kwargs["use_cache"] = generation_config.use_cache
+        model_kwargs["output_attentions"] = generation_config.output_attentions # False
+        model_kwargs["output_hidden_states"] = generation_config.output_hidden_states # False
+        model_kwargs["use_cache"] = generation_config.use_cache # True
 
-        accepts_attention_mask = "attention_mask" in set(inspect.signature(self.call).parameters.keys())
-        requires_attention_mask = "encoder_outputs" not in model_kwargs
+        accepts_attention_mask = "attention_mask" in set(inspect.signature(self.call).parameters.keys()) # True
+        requires_attention_mask = "encoder_outputs" not in model_kwargs # True
 
         if model_kwargs.get("attention_mask", None) is None and requires_attention_mask and accepts_attention_mask:
             model_kwargs["attention_mask"] = self._prepare_attention_mask_for_generation(
                 inputs_tensor, generation_config.pad_token_id, generation_config.eos_token_id
-            )
+            ) # attention mask -> tf.Tensor([[1 1 1 1 1 1 1]], shape=(1, 7), dtype=int32)
 
         # decoder-only models should use left-padding for generation
         if not self.config.is_encoder_decoder:
@@ -845,10 +849,10 @@ class TFGenerationMixin:
                 model_kwargs=model_kwargs,
             )
         else:
-            input_ids = inputs_tensor if model_input_name == "input_ids" else model_kwargs.pop("input_ids")
+            input_ids = inputs_tensor if model_input_name == "input_ids" else model_kwargs.pop("input_ids") # tf.Tensor([[   40  2883  6155   351   616 13779  3290]], shape=(1, 7), dtype=int32)
 
         # 7. Prepare `max_length` depending on other stopping criteria.
-        input_ids_seq_length = shape_list(input_ids)[-1]
+        input_ids_seq_length = shape_list(input_ids)[-1] # 7
         has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
         if has_default_max_length and generation_config.max_new_tokens is None:
             warnings.warn(
@@ -858,7 +862,7 @@ class TFGenerationMixin:
                 UserWarning,
             )
         elif generation_config.max_new_tokens is not None:
-            generation_config.max_length = generation_config.max_new_tokens + input_ids_seq_length
+            generation_config.max_length = generation_config.max_new_tokens + input_ids_seq_length # note how total length is sum of input_ids_seq_length and max_new_tokens
             if not has_default_max_length:
                 logger.warn(
                     f"Both `max_new_tokens` (={generation_config.max_new_tokens}) and `max_length`(="
@@ -1592,31 +1596,31 @@ class TFGenerationMixin:
         # 1. init greedy_search values
         logits_processor = logits_processor if logits_processor is not None else TFLogitsProcessorList()
 
-        max_length = max_length if max_length is not None else self.generation_config.max_length
-        pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
-        eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
+        max_length = max_length if max_length is not None else self.generation_config.max_length # 47
+        pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id # 50256
+        eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id # 50256
         if isinstance(eos_token_id, int):
-            eos_token_id = [eos_token_id]
-        output_scores = output_scores if output_scores is not None else self.generation_config.output_scores
+            eos_token_id = [eos_token_id] # [50256]
+        output_scores = output_scores if output_scores is not None else self.generation_config.output_scores # False
         output_attentions = (
             output_attentions if output_attentions is not None else self.generation_config.output_attentions
-        )
+        )# False
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.generation_config.output_hidden_states
-        )
+        )# False
         return_dict_in_generate = (
             return_dict_in_generate
             if return_dict_in_generate is not None
             else self.generation_config.return_dict_in_generate
-        )
-        use_cache = model_kwargs.pop("use_cache", self.generation_config.use_cache)
+        ) # False
+        use_cache = model_kwargs.pop("use_cache", self.generation_config.use_cache) # True
         use_xla = not tf.executing_eagerly()
         # TODO (Joao): fix cache format or find programatic way to detect cache index
         # GPT2 and other models has a slightly different cache structure, with a different batch axis
         model_name = str(self.decoder) if "EncoderDecoder" in str(self) else str(self)
         cache_batch_axis = 1 if any([model_prefix in model_name for model_prefix in ("TFGPT2", "TFCTRL")]) else 0
         # some models, like XLNet, need more than the last token in the presence of past_key_values
-        needs_full_input = "use_mems" in set(inspect.signature(self.prepare_inputs_for_generation).parameters.keys())
+        needs_full_input = "use_mems" in set(inspect.signature(self.prepare_inputs_for_generation).parameters.keys()) # False
 
         # 2. init `attentions`, `hidden_states`, and `scores` tuples
         scores = [] if (return_dict_in_generate and output_scores) else None
@@ -1625,12 +1629,12 @@ class TFGenerationMixin:
         decoder_hidden_states = [] if (return_dict_in_generate and output_hidden_states) else None
 
         # 3. init tensors to use for "xla-compileable" generate function
-        batch_size, cur_len = shape_list(input_ids)
+        batch_size, cur_len = shape_list(input_ids) # 1,7
 
         # initialize `generated` (`input_ids` padded with `pad_token_id`), `finished_sequences`
-        input_ids_padding = tf.ones((batch_size, max_length - cur_len), dtype=tf.int32) * (pad_token_id or 0)
+        input_ids_padding = tf.ones((batch_size, max_length - cur_len), dtype=tf.int32) * (pad_token_id or 0) # tensor of size 1,40
         generated = tf.concat([input_ids, input_ids_padding], axis=-1)
-        finished_sequences = tf.zeros((batch_size,), dtype=tf.bool)
+        finished_sequences = tf.zeros((batch_size,), dtype=tf.bool) # tf.Tensor([False], shape=(1,), dtype=bool)
 
         # 4. define "xla-compile-able" stop-condition and auto-regressive function
         # define condition fn
