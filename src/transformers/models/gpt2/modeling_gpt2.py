@@ -181,7 +181,7 @@ class GPT2Attention(nn.Module):
         self.pruned_heads = self.pruned_heads.union(heads)
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
-        attn_weights = torch.matmul(query, key.transpose(-1, -2))
+        attn_weights = torch.matmul(query, key.transpose(-1, -2)) # 1, 12, 8, 8
 
         if self.scale_attn_weights:
             attn_weights = attn_weights / torch.full(
@@ -202,9 +202,13 @@ class GPT2Attention(nn.Module):
             mask_value = torch.full([], mask_value, dtype=attn_weights.dtype, device=attn_weights.device)
             attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)
 
+        # change needed here probably
+
         if attention_mask is not None:
             # Apply the attention mask
             attn_weights = attn_weights + attention_mask
+
+        # add flex attention here
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 

@@ -1880,7 +1880,7 @@ class GenerationMixin:
         generation_config._pad_token_tensor = pad_token_tensor
         generation_config._decoder_start_token_tensor = decoder_start_token_tensor
 
-    @torch.no_grad()
+    @torch.no_grad() # to read: what does torch.no_grad() do?
     def generate(
         self,
         inputs: Optional[torch.Tensor] = None,
@@ -1995,7 +1995,7 @@ class GenerationMixin:
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
         stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
 
-        accepts_attention_mask = "attention_mask" in set(inspect.signature(self.forward).parameters.keys())
+        accepts_attention_mask = "attention_mask" in set(inspect.signature(self.forward).parameters.keys()) # attention mask is required because we dont want to attend to padding tokens
         requires_attention_mask = "encoder_outputs" not in model_kwargs
         kwargs_has_attention_mask = model_kwargs.get("attention_mask", None) is not None
 
