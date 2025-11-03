@@ -516,7 +516,7 @@ class MultiModalData:
             return getattr(self, key)
         raise AttributeError(f"{self.__class__.__name__} has no attribute {key}")
 
-
+# A mixin is basically a “bag of behaviors” you inherit from, not a full standalone class you use by itself. 
 class ProcessorMixin(PushToHubMixin):
     """
     This is a mixin used to provide saving/loading functionality for all processor classes.
@@ -562,9 +562,12 @@ class ProcessorMixin(PushToHubMixin):
             )
 
         # Check each arg is of the proper class (this will also catch a user initializing in the wrong order)
+        '''
+        In our case kwargs had image_processor, tokenizer, video_processor. These three get initialized in self
+        '''
         for attribute_name, arg in kwargs.items():
             self.check_argument_for_proper_class(attribute_name, arg)
-            setattr(self, attribute_name, arg)
+            setattr(self, attribute_name, arg) 
 
     def __call__(
         self,
@@ -636,7 +639,7 @@ class ProcessorMixin(PushToHubMixin):
         # Nothing is ever going to be an instance of "AutoXxx", in that case we check the base class.
         class_name = AUTO_TO_BASE_CLASS_MAPPING.get(class_name, class_name)
         if isinstance(class_name, tuple):
-            proper_class = tuple(self.get_possibly_dynamic_module(n) for n in class_name if n is not None)
+            proper_class = tuple(self.get_possibly_dynamic_module(n) for n in class_name if n is not None) # get_possibly_dynamic_module takes a class name string and turns it into the actual class object:
         else:
             proper_class = self.get_possibly_dynamic_module(class_name)
 

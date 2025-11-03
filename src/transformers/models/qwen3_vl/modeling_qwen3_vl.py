@@ -802,10 +802,13 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
 
     def __init__(self, config: Qwen3VLTextConfig):
         super().__init__(config)
-        self.padding_idx = config.pad_token_id
+        self.padding_idx = config.pad_token_id # Not defined and hence none in our mini_qwen3_vl
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx) #32000 x 512 
+        '''
+         If specified, the entries at padding_idx do not contribute to the gradient; therefore, the embedding vector at padding_idx is not updated during training, i.e. it remains as a fixed “pad”. For a newly constructed Embedding, the embedding vector at padding_idx will default to all zeros, but can be updated to another value to be used as the padding vector.
+        '''
         self.layers = nn.ModuleList(
             [Qwen3VLTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -1325,8 +1328,8 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = Qwen3VLModel(config) # receives  B (16) x T (28) in our example
-        self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+        self.model = Qwen3VLModel(config)
+        self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False) # 512 x 32000 
 
         self.post_init()
 
@@ -1390,7 +1393,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             TODO: Add example
         """
         outputs = self.model(
-            input_ids=input_ids, # 2 x 1024 
+            input_ids=input_ids, # 2 x 1024 . 2 batches
             pixel_values=pixel_values, # 32 x 1536 
             pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw, # [2, 3]

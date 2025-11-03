@@ -76,6 +76,46 @@ class Qwen2TokenizerFast(PreTrainedTokenizerFast):
             The token used for padding, for example when batching sequences of different lengths.
     """
 
+    '''
+    2. How spaces are treated (the key idea)
+
+This is the thing you’re actually tripping over:
+
+“Same with GPT2Tokenizer, this tokenizer has been trained to treat spaces like parts of the tokens…”
+
+Concretely:
+
+In GPT-2 / Qwen2 byte-level BPE, spaces are not stripped.
+
+During training, the model sees text like "Hello world" exactly as:
+['H','e','l','l','o',' ','w','o','r','l','d'] (bytes).
+
+BPE then learns merges such as:
+
+"H"+"e" -> "He"
+
+"He" + "llo" -> "Hello"
+
+" " + "world" -> " world" (note: includes the space)
+
+Because " world" (with leading space) is a super frequent pattern, BPE ends up with tokens like:
+
+"Hello"
+
+" world"
+
+" the"
+
+"ing"
+
+" to"
+
+So for most English text, the “default” token for a word is space + word.
+
+That’s why GPT-2 tokenizers often have tokens like "ĠHello" or "Ġworld" in the vocab dumps – that Ġ is just a printable version of “this token starts with space”.
+
+In Qwen2’s case, under the hood it’s the same idea: the vocab distinguishes "Hello" from " Hello" (byte-wise).
+    '''
     vocab_files_names = VOCAB_FILES_NAMES
     model_input_names = ["input_ids", "attention_mask"]
     slow_tokenizer_class = Qwen2Tokenizer

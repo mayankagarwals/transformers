@@ -63,7 +63,8 @@ class Qwen3VLProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer", "video_processor"]
     image_processor_class = "AutoImageProcessor"
     video_processor_class = "AutoVideoProcessor"
-    tokenizer_class = ("Qwen2Tokenizer", "Qwen2TokenizerFast")
+    tokenizer_class = ("Qwen2Tokenizer", "Qwen2TokenizerFast") # Define what kind of tokenizer_class is this processor expecting. If something else is passed in 
+    # tokenizer, raise an error
 
     def __init__(self, image_processor=None, tokenizer=None, video_processor=None, chat_template=None, **kwargs):
         self.image_token = "<|image_pad|>" if not hasattr(tokenizer, "image_token") else tokenizer.image_token
