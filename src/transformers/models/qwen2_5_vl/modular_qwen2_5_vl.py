@@ -199,6 +199,12 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
 
         self.blocks = nn.ModuleList([Qwen2_5_VLVisionBlock(config) for _ in range(config.depth)])
+
+        '''
+The model performs the merge. Once the batch hits the vision→LLM projector, the module reshapes using the stored grid and spatial_merge_size, collapsing each 2×2 bundle before projecting (transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py:203-228 shows the positional logic built around this). After that step, the LLM only sees the reduced token count that matches the placeholders.
+
+
+        '''
         self.merger = Qwen2_5_VLPatchMerger(
             dim=config.out_hidden_size,
             context_dim=config.hidden_size,

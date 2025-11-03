@@ -147,6 +147,13 @@ class Qwen2VLProcessor(ProcessorMixin):
             index = 0
             for i in range(len(text)):
                 while self.image_token in text[i]:
+                    '''
+                    Placeholder count uses the merge. When the processor rewrites the chat string, it divides by merge_size**2 to decide how many <|image_pad|> slots should survive (transformers/models/qwen2_vl/processing_qwen2_vl.py:157-163). Those slots each correspond to a group of merge_size**2 rows in pixel_values.
+
+                    in our case image_grid_thw = [1, 4, 4]
+                    image_grid_thw[0].prod() = 16 
+                    16/2 = 8. So we will have 8 image tokens. Each of shape 1536 
+                    '''
                     num_image_tokens = image_grid_thw[index].prod() // merge_length
                     text[i] = text[i].replace(self.image_token, "<|placeholder|>" * num_image_tokens, 1)
                     index += 1

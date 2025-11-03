@@ -112,6 +112,14 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
+'''
+
+For our example 
+
+q, k : [32, 4, 64]
+cos, sin: [32, 64]
+
+'''
 
 def apply_rotary_pos_emb_vision(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
@@ -928,7 +936,8 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         self.language_model = Qwen3VLTextModel._from_config(config.text_config)
         self.rope_deltas = None  # cache rope_deltas here
 
-        # Initialize weights and apply final processing
+        # Initialize weights and apply final processing. 
+        # Doesn't matter for us. Just think of some method called so that downstream implementers can override for any post init operations
         self.post_init()
 
     def get_input_embeddings(self):
@@ -1086,6 +1095,15 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                 The tensors corresponding to the input images.
             image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
                 The temporal, height and width of feature shape of each image in LLM.
+
+                Shape Flow
+
+pixel_values arrives as 16 flattened patches, each 1 × 4 × 4 grid location, already projected to 1536 channels by the visual backbone’s patch/embed stem. Think of it as T·H·W = 1·4·4 = 16 tokens, each of width 1536.
+The visual encoder (self.visual) linearly projects those tokens to the model hidden size (512 here) and merges spatial neighborhoods. With the default spatial_merge_size=2, every 2 × 2 group of spatial tokens collapses into one, so every image contributes 16 / 2² = 4 tokens after the merge.
+In your run you apparently had two images (or frames) in the batch, so total_tokens_after_merge = 2 × 4 = 8, matching the image_embeds tensor of shape 8 × 512 that comes back from self.visual.
+deepstack_image_embeds is the stack of intermediate visual features from three different depths of the visual tower. That’s why it has shape 3 × 8 × 512: three levels, the same eight merged tokens, each 512‑wide.
+The split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist() line converts the per-image (T, H, W) counts (e.g. [1, 4, 4]) into the “tokens after merge” counts (here [4, 4] if there are two images). torch.split then slices the 8×512 block back into one tensor per image, so afterwards image_embeds is a tuple whose elements are each 4 × 512.
+That matches all of the shapes you observed: 16 input patches → merge by 2×2 → eight final tokens, with three deep-stack copies.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
         image_embeds, deepstack_image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
@@ -1155,11 +1173,11 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
             The temporal, height and width of feature shape of each video in LLM.
         """
-        if (input_ids is None) ^ (inputs_embeds is not None):
+        if (input_ids is None) ^ (inputs_embeds is not None): # same arguments as qwen3vlforconditional generation as it is the first clal
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
-            inputs_embeds = self.get_input_embeddings()(input_ids)
+            inputs_embeds = self.get_input_embeddings()(input_ids) # makes shape [2, 1024, 512] where Qwen3VLTextConfig.hidden_size tells this size here as it is in turn called on language model
 
         image_mask = None
         video_mask = None
@@ -1307,7 +1325,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = Qwen3VLModel(config)
+        self.model = Qwen3VLModel(config) # receives  B (16) x T (28) in our example
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
 
         self.post_init()
@@ -1349,7 +1367,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
+        labels: Optional[torch.LongTensor] = None, # lables: 2 x 1024 
         pixel_values: Optional[torch.Tensor] = None,
         pixel_values_videos: Optional[torch.FloatTensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
@@ -1372,17 +1390,18 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             TODO: Add example
         """
         outputs = self.model(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
+            input_ids=input_ids, # 2 x 1024 
+            pixel_values=pixel_values, # 32 x 1536 
             pixel_values_videos=pixel_values_videos,
-            image_grid_thw=image_grid_thw,
+            image_grid_thw=image_grid_thw, # [2, 3]
             video_grid_thw=video_grid_thw,
             position_ids=position_ids,
-            attention_mask=attention_mask,
+            attention_mask=attention_mask, # 2 x 1024 
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             cache_position=cache_position,
-            **kwargs,
+            **kwargs, # shift_labels : 2 x 1024 
+            # Rest are none 
         )
 
         hidden_states = outputs[0]
