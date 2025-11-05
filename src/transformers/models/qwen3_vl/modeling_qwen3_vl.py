@@ -59,19 +59,38 @@ class Qwen3VLVisionMLP(nn.Module):
 class Qwen3VLVisionPatchEmbed(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
-        self.patch_size = config.patch_size
-        self.temporal_patch_size = config.temporal_patch_size
-        self.in_channels = config.in_channels
-        self.embed_dim = config.hidden_size
+        self.patch_size = config.patch_size # 16
+        self.temporal_patch_size = config.temporal_patch_size # 2
+        self.in_channels = config.in_channels # 3
+        self.embed_dim = config.hidden_size # 256
 
-        kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]
+        kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size] # [2, 16, 16]
         self.proj = nn.Conv3d(self.in_channels, self.embed_dim, kernel_size=kernel_size, stride=kernel_size, bias=True)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        '''
+        run_mini_model_multimodal constructs the model and immediately casts it with model = create_model(model_name).to(dtype).to(device), so when the bf16 test passes dtype=torch.bfloat16, every parameter—including the vision conv kernels—moves to bf16 (test/convergence/bf16/test_mini_models_multimodal.py (line 902)). 
+        So the weight dtype is fp32 or bf16 based on what tests are being run 
+        '''
         target_dtype = self.proj.weight.dtype
+
+
+        '''
+        Why projection? 
+         just forces the image tensor to the same dtype as the patch‑embed conv weights. The vision inputs coming from the processor/dataloader arrive as float32, even when you later cast the model with .to(torch.bfloat16). If you skip that .to(target_dtype) the first conv would see fp32 activations plus bf16 weights; PyTorch promotes the op to fp32 in that case, so the conv output (and everything downstream) would stay fp32, breaking the bf16 run. Casting the activations up front keeps the entire tower in bf16.
+        '''
+
+        # Before projection : [32, 1536]
         hidden_states = hidden_states.view(
             -1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size
-        )
+        ) # project to [32, 3, 2, 16, 16]
+
+
+        '''
+        self.proj will make this (N_eff, C_out = 256, D_out = 1, H_out = 1, W_out = 1)
+        Then.view(-1, self.embed_dim) makes it [N_eff, 256]. -> [32, 256]
+
+        '''
         hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
         return hidden_states
 
@@ -605,18 +624,19 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
 
     def __init__(self, config, *inputs, **kwargs) -> None:
         super().__init__(config, *inputs, **kwargs)
-        self.spatial_merge_size = config.spatial_merge_size
-        self.patch_size = config.patch_size
-        self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
+        self.spatial_merge_size = config.spatial_merge_size # 2
+        self.patch_size = config.patch_size # 16
+        self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size # 4
 
+        # TODO: this step casts hidden_states to bf16. Why is it needed
         self.patch_embed = Qwen3VLVisionPatchEmbed(
             config=config,
         )
 
-        self.pos_embed = nn.Embedding(config.num_position_embeddings, config.hidden_size)
-        self.num_grid_per_side = int(config.num_position_embeddings**0.5)
+        self.pos_embed = nn.Embedding(config.num_position_embeddings, config.hidden_size)  # 256x256
+        self.num_grid_per_side = int(config.num_position_embeddings**0.5) # 16
 
-        head_dim = config.hidden_size // config.num_heads
+        head_dim = config.hidden_size // config.num_heads. # 256/4 = 64
         self.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(head_dim // 2)
 
         self.blocks = nn.ModuleList([Qwen3VLVisionBlock(config) for _ in range(config.depth)])
@@ -677,6 +697,22 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         embeddings = embeddings.flatten(1)
         return embeddings
 
+
+    '''
+
+    position embeddings is per patch in a grid. That is for a [2, 20, 30]  grid, we get [2*20*30, hidden_dimension] worth of position embeddings 
+
+
+    in our mini example we have num_grid_per_side as 16 because num_position_embeddings is 256
+    the model was trained with a maximum grid of 16×16 = 256 spatial positions for vision tokens.
+
+    Let's say we got a grid of 2 x 20 x 30 
+
+
+    
+    
+
+    '''
     def fast_pos_embed_interpolate(self, grid_thw):
         grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
         device = grid_thw.device
@@ -684,18 +720,120 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         idx_list = [[] for _ in range(4)]
         weight_list = [[] for _ in range(4)]
 
-        for t, h, w in zip(grid_ts, grid_hs, grid_ws):
-            h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
-            w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
+        for t, h, w in zip(grid_ts, grid_hs, grid_ws): # 2, 20, 30
+            h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h) # from 0 to 15 in 20 steps 
+            w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)# from 0 to 30 in 20 steps 
+# from 0 to 15 in 20 steps 
 
-            h_idxs_floor = h_idxs.int()
+            '''
+            Some complicated math here 
+            The idea is to get embedding for each of 20*30 patches derived from 16*16 position embeddings we have
+            '''
+            '''
+            🔄 Step 1 — Build target coordinates
+
+These lines:
+
+h_idxs = torch.linspace(0, 15, h)   # 0..15 stretched over 20 samples
+w_idxs = torch.linspace(0, 15, w)   # 0..15 stretched over 30 samples
+
+
+Meaning:
+
+Original grid has coords 0..15
+We need 20 evenly spaced samples vertically
+We need 30 evenly spaced samples horizontally
+
+
+So each target patch maps to a continuous coordinate in the o
+
+            '''
+            # Math start
+            '''
+            🔍 Step 2 — Compute floor / ceil positions
+h_floor = 6
+h_ceil  = 7
+dh = 0.3158     # fractional part
+
+w_floor = 6
+w_ceil  = 7
+dw = 0.2069     # fractional part
+This is now a perfect bilinear interpolation setup:
+
+       w
+       6.00         7.00
+h 6.00   TL ---------- TR
+          |            |
+          |     * P    |
+h 7.00   BL ---------- BR
+
+
+P is the target patch; its embedding will be a weighted mix of TL, TR, BL, BR.
+
+            '''
+            h_idxs_floor = h_idxs.int() 
             w_idxs_floor = w_idxs.int()
             h_idxs_ceil = (h_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
             w_idxs_ceil = (w_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
+            
 
             dh = h_idxs - h_idxs_floor
             dw = w_idxs - w_idxs_floor
 
+'''
+🧮 Step 3 — Convert grid coords → flat embedding index
+
+The stored table is flattened row-major:
+
+row * 16 + col
+
+
+So:
+
+base_h      = 6 * 16 = 96
+base_h_ceil = 7 * 16 = 112
+
+TL index = 96 + 6   = 102
+TR index = 96 + 7   = 103
+BL index = 112 + 6  = 118
+BR index = 112 + 7  = 119
+
+
+✅ These 4 integers are which rows in self.pos_embed.weight we will sample.
+
+
+🏗️ Step 4 — Bilinear weights
+TL = (1-dh)*(1-dw)  = 0.6842 * 0.7931 = 0.542
+TR = (1-dh)*dw      = 0.6842 * 0.2069 = 0.141
+BL = dh*(1-dw)      = 0.3158 * 0.7931 = 0.251
+BR = dh*dw          = 0.3158 * 0.2069 = 0.065
+
+
+They always sum to 1.0, so embedding stays normalized.
+
+✅ If patch falls exactly on a learned grid point (e.g. h_idx=4, w_idx=10), then dh=dw=0 → TL=1, and the other weights are 0.
+
+📦 Step 5 — Gather + mix
+emb_TL = pos_embed[102]
+emb_TR = pos_embed[103]
+emb_BL = pos_embed[118]
+emb_BR = pos_embed[119]
+
+final_embedding = 0.542*emb_TL + 0.141*emb_TR + 0.251*emb_BL + 0.065*emb_BR
+
+
+This produces one interpolated embedding vector for the (8,12) patch.
+
+The loop repeats this for all 600 patches (20×30).
+
+So after this step:
+
+patch_pos_embeds → (600, hidden_dim)
+
+
+✅ Now we have one learned positional embedding per patch in the new grid.
+
+'''
             base_h = h_idxs_floor * self.num_grid_per_side
             base_h_ceil = h_idxs_ceil * self.num_grid_per_side
 
@@ -723,16 +861,24 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
 
         patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws)])
+        # Math end
+        # you have as many pos_embed as samples in batches
+
 
         patch_pos_embeds_permute = []
         merge_size = self.config.spatial_merge_size
         for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
-            pos_embed = pos_embed.repeat(t, 1)
+            '''
+            We don't store temporal embeddings here. If there are 8 time frames for some hxw. we will just repeat it 8 times 
+
+            '''
+            pos_embed = pos_embed.repeat(t, 1) # t copies along dimension 0, 1 copy along dimension 1 
             pos_embed = (
-                pos_embed.view(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
+                pos_embed.view(t, h // merge_size, merge_size, w // merge_size, merge_size, -1) # split the merge away
                 .permute(0, 1, 3, 2, 4, 5)
                 .flatten(0, 4)
             )
+            # same number but differnt grouping
             patch_pos_embeds_permute.append(pos_embed)
         patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
         return patch_pos_embeds
@@ -742,24 +888,25 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         Args:
             hidden_states (`torch.Tensor` of shape `(seq_len, hidden_size)`):
                 The final hidden states of the model.
-            grid_thw (`torch.Tensor` of shape `(num_images_or_videos, 3)`):
+            grid_thw (`torch.Tensor` of shape `(num_images_or_videos, 3)`):  shape: 2 x 3 [[1, 4, 4], [1, 4, 4]]
                 The temporal, height and width of feature shape of each image in LLM.
 
         Returns:
             `torch.Tensor`: hidden_states.
         """
-        hidden_states = self.patch_embed(hidden_states)
+        # input hidden_states shape [32, 1536]. 2 batches of [16, 1536]
+        hidden_states = self.patch_embed(hidden_states) # cast to [32, 256]. Converting patch to embedding
 
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        pos_embeds = self.fast_pos_embed_interpolate(grid_thw) # of shape [32, 256] . Essentially per patch position embedding
         hidden_states = hidden_states + pos_embeds
 
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        rotary_pos_emb = self.rot_pos_emb(grid_thw) # of shape [32, 32]
 
-        seq_len, _ = hidden_states.size()
-        hidden_states = hidden_states.reshape(seq_len, -1)
-        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
+        seq_len, _ = hidden_states.size() # 32
+        hidden_states = hidden_states.reshape(seq_len, -1) # already in this shape
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1) # already in this shape
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1) # 32, 64
+        position_embeddings = (emb.cos(), emb.sin()) # tuple of shape 32,64 each
 
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
             dim=0,
@@ -1108,7 +1255,7 @@ deepstack_image_embeds is the stack of intermediate visual features from three d
 The split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist() line converts the per-image (T, H, W) counts (e.g. [1, 4, 4]) into the “tokens after merge” counts (here [4, 4] if there are two images). torch.split then slices the 8×512 block back into one tensor per image, so afterwards image_embeds is a tuple whose elements are each 4 × 512.
 That matches all of the shapes you observed: 16 input patches → merge by 2×2 → eight final tokens, with three deep-stack copies.
         """
-        pixel_values = pixel_values.type(self.visual.dtype)
+        pixel_values = pixel_values.type(self.visual.dtype) # shape [32, 1536]. 2 batches of [16, 1536]
         image_embeds, deepstack_image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         image_embeds = torch.split(image_embeds, split_sizes)
@@ -1181,6 +1328,7 @@ That matches all of the shapes you observed: 16 input patches → merge by 2×2 
 
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids) # makes shape [2, 1024, 512] where Qwen3VLTextConfig.hidden_size tells this size here as it is in turn called on language model
+            # uses embed_tokens defined in Qwen3VLTextModel . get_input_embeddings is defined in PretrainedModel to refer to embed_tokens variable of subclass 
 
         image_mask = None
         video_mask = None
@@ -1376,7 +1524,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
+        logits_to_keep: Union[int, torch.Tensor] = 0, # used in generation. Only take last 
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen3VLCausalLMOutputWithPast]:
         r"""
@@ -1407,11 +1555,11 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             # Rest are none 
         )
 
-        hidden_states = outputs[0]
+        hidden_states = outputs[0]. # batch_size x seq_len x hidden_dimension = 16 x 128 x 1536
 
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep. 
+        logits = self.lm_head(hidden_states[:, slice_indices, :]) # for generation you only need last token.
 
         loss = None
         if labels is not None:
