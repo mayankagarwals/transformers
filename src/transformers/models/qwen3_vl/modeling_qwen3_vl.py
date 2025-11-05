@@ -98,12 +98,49 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
 class Qwen3VLVisionRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
-    def __init__(self, dim: int, theta: float = 10000.0) -> None:
+    def __init__(self, dim: int, theta: float = 10000.0) -> None: # dim = head_dim//2 = 32
         super().__init__()
+        '''
+        dim here is half of the attention head dimension (head_dim//2).
+
+torch.arange(0, dim, 2) makes indices [0, 2, 4, ...] → length = dim/2 entries.
+With dim=32, this yields 16 values.
+
+inv_freq[j] = theta^{-(index/dim)} is the classic RoPE geometric frequency schedule.
+Result: inv_freq has shape [dim/2] (= 16 in the example).
+
+It’s registered as a buffer so it moves with the module across devices/dtypes but isn’t a parameter.
+        '''
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, seqlen: int) -> torch.Tensor:
+        '''
+        nput: seqlen = how many distinct coordinate values you’ll need angles for (e.g., up to max(H, W)).
+
+seq is [0, 1, 2, ..., seqlen-1], shape [seqlen].
+
+torch.outer(seq, inv_freq) → [seqlen, dim/2] containing the angles pos * inv_freq[k].
+(The sin/cos are taken later; here we just produce the angle table.)
+
+So forward(max_hw) yields a lookup table of angles for coordinate values 0..max_hw-1:
+freq_table shape = [max_hw, dim/2] (e.g., [max_hw, 16] when dim=32).
+
+torch.outer just means “all pairwise products between two 1D tensors,” arranged in a matrix.
+
+More concretely:
+
+Suppose you have
+a = tensor([a0, a1, a2]) (shape [3])
+b = tensor([b0, b1]) (shape [2])
+
+Then
+
+torch.outer(a, b)
+
+
+gives a 2D tensor of shape [3, 2]
+        '''
         seq = torch.arange(seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
         freqs = torch.outer(seq, self.inv_freq)
         return freqs
@@ -218,8 +255,11 @@ class Qwen3VLVisionAttention(nn.Module):
         query_states, key_states, value_states = (
             self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
         )
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+        cos, sin = position_embeddings  # tuple of shape 32,64 each. This for 32 total tokens (2 batch of [1,4,4]). 32 pair angles repeated.
+
+        #you don't need to understand the details of this
+        # just that q,k got rotated and now when they are multiplied they will have relative encoding
+        query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin) 
 
         query_states = query_states.transpose(0, 1).unsqueeze(0)
         key_states = key_states.transpose(0, 1).unsqueeze(0)
@@ -637,7 +677,7 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         self.num_grid_per_side = int(config.num_position_embeddings**0.5) # 16
 
         head_dim = config.hidden_size // config.num_heads. # 256/4 = 64
-        self.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(head_dim // 2)
+        self.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(head_dim // 2) # 32
 
         self.blocks = nn.ModuleList([Qwen3VLVisionBlock(config) for _ in range(config.depth)])
         self.merger = Qwen3VLVisionPatchMerger(
@@ -658,14 +698,17 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
 
         self.gradient_checkpointing = False
 
+    '''
+    input shape: [2, 3]. 2 batches of [1, 4, 4]
+    '''
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        merge_size = self.spatial_merge_size
+        merge_size = self.spatial_merge_size # 2
 
-        max_hw = int(grid_thw[:, 1:].max().item())
-        freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim // 2)
+        max_hw = int(grid_thw[:, 1:].max().item()) # max among height or width across all batches
+        freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim // 2). Build a lookup table. Which is essentially for a given position what is the pos*frequence value. This is the rotation angle
         device = freq_table.device
 
-        total_tokens = int(torch.prod(grid_thw, dim=1).sum().item())
+        total_tokens = int(torch.prod(grid_thw, dim=1).sum().item())  # total tokens T*H*W (batch 1) + T*H*W (batch_2)
         pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
 
         offset = 0
@@ -900,12 +943,12 @@ patch_pos_embeds → (600, hidden_dim)
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw) # of shape [32, 256] . Essentially per patch position embedding
         hidden_states = hidden_states + pos_embeds
 
-        rotary_pos_emb = self.rot_pos_emb(grid_thw) # of shape [32, 32]
+        rotary_pos_emb = self.rot_pos_emb(grid_thw) # of shape [32, 32]. for the total 32 tokens in this branch, each would have head_dim//2 = 32 angles (32 pairs). These are those angles
 
         seq_len, _ = hidden_states.size() # 32
         hidden_states = hidden_states.reshape(seq_len, -1) # already in this shape
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1) # already in this shape
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1) # 32, 64
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1) # 32, 64. Made it [seq_len, head_dim]
         position_embeddings = (emb.cos(), emb.sin()) # tuple of shape 32,64 each
 
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
