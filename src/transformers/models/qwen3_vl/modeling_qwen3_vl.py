@@ -945,7 +945,7 @@ patch_pos_embeds → (600, hidden_dim)
 
         rotary_pos_emb = self.rot_pos_emb(grid_thw) # of shape [32, 32]. for the total 32 tokens in this branch, each would have head_dim//2 = 32 angles (32 pairs). These are those angles
 
-        seq_len, _ = hidden_states.size() # 32
+        seq_len, _ = hidden_states.size() # 32 = number of total patches. [[1, 4, 4], [1, 4, 4 ]
         hidden_states = hidden_states.reshape(seq_len, -1) # already in this shape
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1) # already in this shape
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1) # 32, 64. Made it [seq_len, head_dim]
@@ -969,6 +969,30 @@ patch_pos_embeds → (600, hidden_dim)
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
+            '''
+            ✅ What are deepstack_visual_indexes?
+
+The config contains something like:
+
+deepstack_visual_indexes = [2, 5, 7]
+
+
+Meaning:
+
+“I want to extract extra visual features from block 2, 5, and 7 (not just the final layer).”
+
+These are used for DeepStack, a mechanism described in the paper
+🔗 DeepStack: Deep Visual Feature Injection for Vision-Language Models (2024).
+
+Instead of using only the final vision embedding, the text decoder gets multiple feature levels (like LLaVA-NeXT does with CLIP).
+
+🔍 What is happening?
+
+✔ The vision tokens pass through each transformer block
+✔ When the loop hits a layer that is selected for DeepStack (e.g. layer 2 or 5 or 7)
+✔ It applies an extra MLP merger (Qwen3VLVisionPatchMerger) to compress features
+✔ That result is appended into deepstack_feature_lists
+            '''
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_feature = self.deepstack_merger_list[self.deepstack_visual_indexes.index(layer_num)](
                     hidden_states
@@ -1315,7 +1339,8 @@ That matches all of the shapes you observed: 16 input patches → merge by 2×2 
         Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
         equal to the length of multimodal features. If the lengths are different, an error is raised.
         """
-        if input_ids is None:
+        if input_ids is None: # shape [2, 1024]
+
             special_image_mask = inputs_embeds == self.get_input_embeddings()(
                 torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
             )
@@ -1325,16 +1350,36 @@ That matches all of the shapes you observed: 16 input patches → merge by 2×2 
             )
             special_video_mask = special_video_mask.all(-1)
         else:
+                        '''
+            special_image_mask is a boolean matrix of shape [batch, seq_len], True wherever token == <image>.
+
+Same for special_video_mask and <video>.
+image_token_id = 4 
+special_image_mask of shape [2, 1024]
+            '''
             special_image_mask = input_ids == self.config.image_token_id
             special_video_mask = input_ids == self.config.video_token_id
 
-        n_image_tokens = special_image_mask.sum()
+        n_image_tokens = special_image_mask.sum() # total number of image tokens across the batch (scalar)
+        '''
+        special_image_mask was [B, L], they now:
+
+unsqueeze(-1) → [B, L, 1]
+
+expand_as(inputs_embeds) → [B, L, hidden_size] = [2, 1024, 512] = shape of inputs_embeds
+        '''
         special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+
+        '''
+        inputs_embeds[special_image_mask].shape is [8,512] since we have 8 image tokens. 
+        Make sure this is same as image features
+        '''
         if image_features is not None and inputs_embeds[special_image_mask].numel() != image_features.numel():
             raise ValueError(
                 f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {image_features.shape[0]}"
             )
 
+        # ignoring video for now
         n_video_tokens = special_video_mask.sum()
         special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
         if video_features is not None and inputs_embeds[special_video_mask].numel() != video_features.numel():
@@ -1377,11 +1422,28 @@ That matches all of the shapes you observed: 16 input patches → merge by 2×2 
         video_mask = None
 
         if pixel_values is not None:
-            image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
-            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw) # shape: tuple of [4,512] + 3x8x512
+            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype) # became [8,512] by merging the tuple
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )
+            '''
+            masked_scatter(mask, source):
+
+Flattens inputs_embeds and mask;
+
+Fills the masked positions (True) with values from image_embeds.flatten() in order.
+
+So each <image> placeholder embedding vector is replaced by the corresponding row from image_embeds.
+
+After this line:
+
+All <image> tokens in the text sequence now hold visual embeddings instead of learned token embeddings.
+
+We took the pixel values of shape [32, 1536]. converted into 8 image tokens (somehow, will learn more here) and replaced in our input embedding the embedding 
+of image tokens with this.
+Todo: if we're blindly replacing why even learn embedding before this for image tokens.
+            '''
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         if pixel_values_videos is not None:
@@ -1408,8 +1470,9 @@ That matches all of the shapes you observed: 16 input patches → merge by 2×2 
                 embed_joint[video_mask_joint, :] = vid_embed
                 deepstack_visual_embeds.append(embed_joint)
         elif image_mask is not None:
-            image_mask = image_mask[..., 0]
-            visual_pos_masks = image_mask
+            image_mask = image_mask[..., 0] # we expanded image_mask to be true 512 times if its true for a token above for simpler math of replacement. now we're just converting
+            # it back to [2, 1024] shape by considering first embedding value
+            visual_pos_masks = image_mask # no videos = Simple: all visual positions are images; keep the original deepstack list as-is.
             deepstack_visual_embeds = deepstack_image_embeds
         elif video_mask is not None:
             video_mask = video_mask[..., 0]
@@ -1417,9 +1480,12 @@ That matches all of the shapes you observed: 16 input patches → merge by 2×2 
             deepstack_visual_embeds = deepstack_video_embeds
 
         if position_ids is None:
+            # attention_mask is of shape [2, 1024] and in our case its a simple tensor
             attention_mask_tensor = (
                 attention_mask if not isinstance(attention_mask, dict) else attention_mask["full_attention"]
             )
+
+            # attention_mask.ndim for us is 2 
             if attention_mask_tensor is not None and attention_mask_tensor.ndim == 4:
                 attention_mask_tensor = torch.diagonal(attention_mask_tensor[:, 0], dim1=1, dim2=2)
                 # Only apply conversion for floating point tensors (inverted masks)
@@ -1431,6 +1497,14 @@ That matches all of the shapes you observed: 16 input patches → merge by 2×2 
             # When compiling, we can't check tensor values thus we check only input length
             # It is safe to assume that `length!=1` means we're in pre-fill because compiled
             # models currently cannot do asssisted decoding
+            '''
+            Now they figure out if this is prefill (first forward of generation) or decode (subsequent steps):
+            Roughly:
+
+Prefill if:
+
+Sequence length > 1 and this is the first time (no past keys or cache_position=0).
+            '''
             prefill_compiled_stage = is_torchdynamo_compiling() and (
                 (input_ids is not None and input_ids.shape[1] != 1)
                 or (inputs_embeds is not None and inputs_embeds.shape[1] != 1)
@@ -1466,11 +1540,11 @@ That matches all of the shapes you observed: 16 input patches → merge by 2×2 
             input_ids=None,
             position_ids=position_ids,
             attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
+            past_key_values=past_key_values, # can be assumed None for now and covered in kv cache
+            inputs_embeds=inputs_embeds, # these are already fused text+visual embeddings (placeholders replaced). 
             cache_position=cache_position,
-            visual_pos_masks=visual_pos_masks,
-            deepstack_visual_embeds=deepstack_visual_embeds,
+            visual_pos_masks=visual_pos_masks, #[2, 1024] -> telling where visual tokens are 
+            deepstack_visual_embeds=deepstack_visual_embeds, # [3, 8, 512] visual embeds from between layers.
             **kwargs,
         )
 
