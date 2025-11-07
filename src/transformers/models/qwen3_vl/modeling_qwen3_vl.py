@@ -149,14 +149,16 @@ gives a 2D tensor of shape [3, 2]
 class Qwen3VLVisionPatchMerger(nn.Module):
     def __init__(self, config: Qwen3VLVisionConfig, use_postshuffle_norm=False) -> None:
         super().__init__()
-        self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
+        self.hidden_size = config.hidden_size * (config.spatial_merge_size**2) # 256*4 = 1024
         self.use_postshuffle_norm = use_postshuffle_norm
         self.norm = nn.LayerNorm(self.hidden_size if use_postshuffle_norm else config.hidden_size, eps=1e-6)
         self.linear_fc1 = nn.Linear(self.hidden_size, self.hidden_size)
         self.act_fn = nn.GELU()
-        self.linear_fc2 = nn.Linear(self.hidden_size, config.out_hidden_size)
+        self.linear_fc2 = nn.Linear(self.hidden_size, config.out_hidden_size) # out_hidden_size = 512
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # transforms incoming vector to [Neff, 1024] And then transfomrs this to [Neff, 512]
+        # In our case we get [32, 256] which gets converted to [8, 1024] and then [8, 512]
         x = self.norm(x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x).view(-1, self.hidden_size)
         x = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
         return x
@@ -1012,7 +1014,7 @@ Instead of using only the final vision embedding, the text decoder gets multiple
 )
 class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
     config: Qwen3VLTextConfig
-    _no_split_modules = ["Qwen3VLTextDecoderLayer"]
+    _no_split_modules = ["Qwen3VLTextDecoderLayer"] # Declares the model type and tells HF not to split Qwen3VLTextDecoderLayer across device shards.
 
     def __init__(self, config: Qwen3VLTextConfig):
         super().__init__(config)
@@ -1026,7 +1028,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         self.layers = nn.ModuleList(
             [Qwen3VLTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps) # 512
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
@@ -1037,12 +1039,12 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
     @auto_docstring
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.LongTensor] = None, # None
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None, # [2, 1024, 512]
+        use_cache: Optional[bool] = None, # False
         cache_position: Optional[torch.LongTensor] = None,
         # args for deepstack
         visual_pos_masks: Optional[torch.Tensor] = None,
@@ -1064,28 +1066,28 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         if use_cache and past_key_values is None and not torch.jit.is_tracing():
             past_key_values = DynamicCache(config=self.config)
 
-        if inputs_embeds is None:
+        if inputs_embeds is None: # Not true so skipped
             inputs_embeds = self.embed_tokens(input_ids)
 
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0 # 0
+            cache_position = torch.arange( # arange(0, 1024)
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
 
         # the hard coded `3` is for temporal, height and width.
-        if position_ids is None:
+        if position_ids is None: # false
             position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
-        elif position_ids.ndim == 2:
+        elif position_ids.ndim == 2: # false
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
-        if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+        if position_ids.ndim == 3 and position_ids.shape[0] == 4: # false
             text_position_ids = position_ids[0]
             position_ids = position_ids[1:]
-        else:
-            text_position_ids = position_ids[0]
+        else: # true
+            text_position_ids = position_ids[0] # take first dimension among the 3 avialable [3,2,1024]. ends up shape as [2, 1024]
 
-        attention_mask = create_causal_mask(
+        attention_mask = create_causal_mask( # of shape [2, 1, 1024, 1024]. The causal mask . which is just boolean
             config=self.config,
             input_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -1097,7 +1099,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         hidden_states = inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids) # tuple. each of shape [2, 1024, 64]
 
         # decoder layers
         for layer_idx, decoder_layer in enumerate(self.layers):
@@ -1110,17 +1112,19 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-            hidden_states = layer_outputs
+            hidden_states = layer_outputs # [2, 1024, 512]
 
             # add visual features to the hidden states of first several layers
+            # in our case we have three. so first three layers will get the addition
+            # deepstack_visual_embeds is of shape 3x8x512
             if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
-                hidden_states = self._deepstack_process(
+                hidden_states = self._deepstack_process(. # simple addition of these additional visual embeddings
                     hidden_states,
                     visual_pos_masks,
-                    deepstack_visual_embeds[layer_idx],
+                    deepstack_visual_embeds[layer_idx], # becomes shape 8x512 because you'll find 8 visual tokens
                 )
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states) # norm
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -1130,7 +1134,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
     def _deepstack_process(
         self, hidden_states: torch.Tensor, visual_pos_masks: torch.Tensor, visual_embeds: torch.Tensor
     ):
-        visual_pos_masks = visual_pos_masks.to(hidden_states.device)
+        visual_pos_masks = visual_pos_masks.to(hidden_states.device) # shape [2,1024] telling where are visual masks present
         visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
         hidden_states = hidden_states.clone()
         local_this = hidden_states[visual_pos_masks, :] + visual_embeds
@@ -1169,47 +1173,143 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
     def get_decoder(self):
         return self.language_model
 
+'''
+Cool — here’s a tiny, concrete walk-through with real numbers.
+
+We’ll do B=1, L=14 tokens. Special IDs (mini):
+<vision_start>=1, <image>=4. Merge size = 2 ⇒ LM sees a 2×2 grid ⇒ 4 visual tokens per image.
+
+Input (toy)
+
+Text stream (indices 0..13):
+
+[ t0, t1, t2, t3,  <vs>,  <img>, <img>, <img>, <img>,  t4, t5, t6, t7, t8 ]
+   0   1   2   3     4      5      6      7      8      9  10  11  12  13  (positions)
+
+
+One image block with 4 <image> placeholders (because merged 2×2 = 4 tokens).
+
+image_grid_thw = [1,4,4] → LM grid (t=1, h=2, w=2) → 4 visual tokens.
+
+What get_rope_index builds
+
+We construct position_ids of shape [3, B, L] = [3, 1, 14]: three planes (T,H,W) over the whole sequence.
+
+Break the sequence into 3 chunks:
+
+Text before image: indices [0..3] → length 4
+Put 0,1,2,3 in all three planes.
+
+Visual block: 4 tokens (2×2)
+Local grid:
+
+t_index (len 4): [0,0,0,0]
+
+h_index (len 4): [0,0,1,1]
+
+w_index (len 4): [0,1,0,1]
+Then offset everything by the running stream position 4 (the text length so far), i.e. add +4.
+
+Trailing text: indices [9..13] → length 5
+Continue the simple counter in all three planes: 8,9,10,11,12,13? Careful: the running max after the visual chunk is 7, so trailing text starts at 8 and runs to 13.
+
+Putting it all together (rows = planes T/H/W, columns = sequence positions 0..13):
+
+T plane: [ 0, 1, 2, 3,   4, 4, 4, 4,   8, 9,10,11,12,13 ]
+H plane: [ 0, 1, 2, 3,   4, 4, 5, 5,   8, 9,10,11,12,13 ]
+W plane: [ 0, 1, 2, 3,   4, 5, 4, 5,   8, 9,10,11,12,13 ]
+
+
+So the full output:
+
+position_ids.shape == [3,1,14], values as above.
+
+The visual window (cols 4–7) encodes a 2D pattern in H/W:
+
+H: [4,4,5,5] (rows 0,0,1,1 offset by 4)
+
+W: [4,5,4,5] (cols 0,1,0,1 offset by 4)
+
+T: constant 4 across the block (because LM time for an image is a single slice), also offset to keep the whole stream continuous.
+
+And the second return value
+mrope_position_deltas = (max(position_ids for this sample) + 1) - L
+                      = (13 + 1) - 14
+                      = 0
+
+
+Shape is [B,1] = [1,1] here: [[0]].
+
+This delta is used during decoding (next tokens after prefill): the model builds a simple 1-D position for the new token and adds this delta so the new step’s RoPE phase continues seamlessly from the prefill positions.
+
+
+
+'''
     def get_rope_index(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        image_grid_thw: Optional[torch.LongTensor] = None,
-        video_grid_thw: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.LongTensor] = None, # [2, 1024]
+        image_grid_thw: Optional[torch.LongTensor] = None, # not shape but actual value itself is [1,4,4]
+        video_grid_thw: Optional[torch.LongTensor] = None, # None
+        attention_mask: Optional[torch.Tensor] = None, # [2, 1024]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Different from the original implementation, Qwen3VL use timestamps rather than absolute time position ids."""
 
+        # for our example, skip
         # Since we use timestamps to seperate videos, like <t1> <vision_start> <frame1> <vision_end> <t2> <vision_start> <frame2> <vision_end>, the video_grid_thw should also be split
         if video_grid_thw is not None:
             video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
             video_grid_thw[:, 0] = 1
 
-        spatial_merge_size = self.config.vision_config.spatial_merge_size
-        image_token_id = self.config.image_token_id
-        video_token_id = self.config.video_token_id
-        vision_start_token_id = self.config.vision_start_token_id
-        mrope_position_deltas = []
+        spatial_merge_size = self.config.vision_config.spatial_merge_size # 2 
+        image_token_id = self.config.image_token_id # 4
+        video_token_id = self.config.video_token_id# 5
+        vision_start_token_id = self.config.vision_start_token_id # 1
+        mrope_position_deltas = [] # will store, per batch item, how far MRoPE positions extend beyond vanilla text positions (used to offset positions during decode).
         if input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
             total_input_ids = input_ids
-            if attention_mask is None:
+            if attention_mask is None: # Use the provided attention_mask, else treat everything as valid. we do have it so yay
                 attention_mask = torch.ones_like(total_input_ids)
             position_ids = torch.ones(
                 3,
-                input_ids.shape[0],
-                input_ids.shape[1],
+                input_ids.shape[0],#2 -> batch
+                input_ids.shape[1], #1024 -> tokens
                 dtype=input_ids.dtype,
                 device=input_ids.device,
             )
             image_index, video_index = 0, 0
             attention_mask = attention_mask.to(total_input_ids.device)
-            for i, input_ids in enumerate(total_input_ids):
-                input_ids = input_ids[attention_mask[i] == 1]
+            for i, input_ids in enumerate(total_input_ids): # per batch
+                input_ids = input_ids[attention_mask[i] == 1] # drop padded tokens via mask. Now input_ids is the active sequence.
+                # we have 28
+
+                '''
+                The pattern in the prompt is ... <vision_start> <image|video> ....
+
+Look at the token after each <vision_start> to count how many images/videos appear in this sample.
+
+Example: if the prompt contains two images, image_nums=2.
+                '''
                 image_nums, video_nums = 0, 0
+                '''
+                For a 1D input, torch.argwhere returns shape [K, 1], where K is the number of positions where the condition is True.
+                For a nd tensor it is [K,n]
+                For an input tensor of shape [d0, d1, ..., d(n-1)],
+torch.argwhere(condition) returns a tensor of shape [K, n],
+where each row is the full n-dim index of a True entry.
+
+                That's why squeeze is needed
+                input_ids let's say has shape [31]
+                torch.argwhere(input_ids == vision_start_token_id) returns [[12]]
+                squeeze makes it [12]
+                '''
                 vision_start_indices = torch.argwhere(input_ids == vision_start_token_id).squeeze(1)
+                # list of tokens after vision start
                 vision_tokens = input_ids[vision_start_indices + 1]
-                image_nums = (vision_tokens == image_token_id).sum()
-                video_nums = (vision_tokens == video_token_id).sum()
+                image_nums = (vision_tokens == image_token_id).sum() # 1
+                video_nums = (vision_tokens == video_token_id).sum() # 0
                 input_tokens = input_ids.tolist()
                 llm_pos_ids_list: list = []
+                # st is a moving pointer over input_tokens (start index of the current text region we haven’t covered yet).
                 st = 0
                 remain_images, remain_videos = image_nums, video_nums
                 for _ in range(image_nums + video_nums):
@@ -1242,10 +1342,10 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                         ed = ed_video
                     llm_grid_t, llm_grid_h, llm_grid_w = (
                         t.item(),
-                        h.item() // spatial_merge_size,
-                        w.item() // spatial_merge_size,
+                        h.item() // spatial_merge_size, # 4 -> 2
+                        w.item() // spatial_merge_size, # 4 -> 2
                     )
-                    text_len = ed - st
+                    text_len = ed - st # Length of the text span right before the visual block.
 
                     st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
                     llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
@@ -1263,7 +1363,44 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                     llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
 
                 llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+                '''
+
+position_ids was preallocated as [3, B, L] (T/H/W × batch × seqlen) filled with 1s.
+
+For batch item i, it selects only the active (non-padded) token slots via attention_mask[i] == 1.
+
+It copies your per-sample positions (llm_positions, shape [3, seqlen_active]) into those slots.
+
+.to(position_ids.device) just ensures both tensors are on the same device.
+
+position_ids shape is [3,2,1024]
+                '''
                 position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
+                '''
+                llm_positions.max() + 1 = the next position index after all text+visual chunks you constructed in prefill.
+
+len(total_input_ids[i]) = the raw sequence length L for sample i (including visual placeholders in the text stream).
+
+Their difference is the delta: how far the multi-axis scheme advanced beyond a simple 0..L-1 counter.
+
+Why needed: during decode (next tokens after prefill), the model won’t rebuild the whole T/H/W structure. Instead, it reuses this delta to offset the new step’s positions so they continue seamlessly from prefill.
+
+
+In our case also 
+tensor([[ 0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 13, 13, 13, 15,
+         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
+         34, 35],
+        [ 0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 13, 14, 14, 15,
+         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
+         34, 35],
+        [ 0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 13, 14, 15,
+         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
+         34, 35]])
+         this is llm_positions
+         36 comes after this but len(total_input_ids[i]) is 1024. This diff is negative and stored and used in decoding
+
+
+                '''
                 mrope_position_deltas.append(llm_positions.max() + 1 - len(total_input_ids[i]))
             mrope_position_deltas = torch.tensor(mrope_position_deltas, device=input_ids.device).unsqueeze(1)
             return position_ids, mrope_position_deltas
@@ -1324,8 +1461,8 @@ That matches all of the shapes you observed: 16 input patches → merge by 2×2 
         """
         pixel_values = pixel_values.type(self.visual.dtype) # shape [32, 1536]. 2 batches of [16, 1536]
         image_embeds, deepstack_image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
-        image_embeds = torch.split(image_embeds, split_sizes)
+        split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist() # 4
+        image_embeds = torch.split(image_embeds, split_sizes) # splits 
         return image_embeds, deepstack_image_embeds
 
     def get_placeholder_mask(
@@ -1393,16 +1530,16 @@ expand_as(inputs_embeds) → [B, L, hidden_size] = [2, 1024, 512] = shape of inp
     @check_model_inputs()
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        pixel_values: Optional[torch.Tensor] = None,
-        pixel_values_videos: Optional[torch.FloatTensor] = None,
-        image_grid_thw: Optional[torch.LongTensor] = None,
-        video_grid_thw: Optional[torch.LongTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor = None,  # 32 x 1536 
+        attention_mask: Optional[torch.Tensor] = None,# 2 x 1024 
+        position_ids: Optional[torch.LongTensor] = None, # None
+        past_key_values: Optional[Cache] = None, # None
+        inputs_embeds: Optional[torch.FloatTensor] = None, # None
+        pixel_values: Optional[torch.Tensor] = None, # # 32 x 1536 
+        pixel_values_videos: Optional[torch.FloatTensor] = None, # None
+        image_grid_thw: Optional[torch.LongTensor] = None,# [2, 3] 
+        video_grid_thw: Optional[torch.LongTensor] = None, # None
+        cache_position: Optional[torch.LongTensor] = None, # None
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen3VLModelOutputWithPast]:
         r"""
@@ -1422,8 +1559,11 @@ expand_as(inputs_embeds) → [B, L, hidden_size] = [2, 1024, 512] = shape of inp
         video_mask = None
 
         if pixel_values is not None:
+            '''
+            deepstack_image_embeds obtained here are directly hadded to first few layers of hidden states
+            '''
             image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw) # shape: tuple of [4,512] + 3x8x512
-            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype) # became [8,512] by merging the tuple
+            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype) # became [8,512] by merging the tuple. Here 8 is 2(batch)x4(tokens). 4 tokens as 1x4x4 beomes 1x2x2 (spatial merge = 2)
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )
@@ -1485,7 +1625,7 @@ Todo: if we're blindly replacing why even learn embedding before this for image 
                 attention_mask if not isinstance(attention_mask, dict) else attention_mask["full_attention"]
             )
 
-            # attention_mask.ndim for us is 2 
+            # attention_mask.ndim for us is 2 so this is skipped. 
             if attention_mask_tensor is not None and attention_mask_tensor.ndim == 4:
                 attention_mask_tensor = torch.diagonal(attention_mask_tensor[:, 0], dim1=1, dim2=2)
                 # Only apply conversion for floating point tensors (inverted masks)
@@ -1538,14 +1678,14 @@ Sequence length > 1 and this is the first time (no past keys or cache_position=0
 
         outputs = self.language_model(
             input_ids=None,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
+            position_ids=position_ids, # shape [3, 2, 1024]
+            attention_mask=attention_mask, # shape [2, 2024]
             past_key_values=past_key_values, # can be assumed None for now and covered in kv cache
-            inputs_embeds=inputs_embeds, # these are already fused text+visual embeddings (placeholders replaced). 
-            cache_position=cache_position,
+            inputs_embeds=inputs_embeds, # these are already fused text+visual embeddings (placeholders replaced). # [2 , 1024, 512] 
+            cache_position=cache_position, # None
             visual_pos_masks=visual_pos_masks, #[2, 1024] -> telling where visual tokens are 
             deepstack_visual_embeds=deepstack_visual_embeds, # [3, 8, 512] visual embeds from between layers.
-            **kwargs,
+            **kwargs, # kwargs['shift_labels'] is [2,1024]
         )
 
         return Qwen3VLModelOutputWithPast(
@@ -1596,7 +1736,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         self.model = Qwen3VLModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False) # 512 x 32000 
 
-        self.post_init()
+        self.post_init() # give new checpoint to post init as you want consumers to wait for above lm head to intialize before considering init is done
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
@@ -1672,21 +1812,26 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             # Rest are none 
         )
 
-        hidden_states = outputs[0]. # batch_size x seq_len x hidden_dimension = 16 x 128 x 1536
+        hidden_states = outputs[0]. # batch_size x seq_len x hidden_dimension = 2 x 1024 x 512
 
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        # in case of training this ends up being a no=op
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep. 
         logits = self.lm_head(hidden_states[:, slice_indices, :]) # for generation you only need last token.
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
+            # logits: [2, 1024, 32000]
+            # labels: [2, 1024]
+            # self.config.text_config.vocab_size: 320000
+            # loss function is the one defined in loss_utils
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size) # scalar tensor
 
         return Qwen3VLCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values=outputs.past_key_values,
-            rope_deltas=outputs.rope_deltas,
+            past_key_values=outputs.past_key_values,# None
+            rope_deltas=outputs.rope_deltas, # value is just [[-995], [-998]]
         )
 
     def prepare_inputs_for_generation(
