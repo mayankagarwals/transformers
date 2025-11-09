@@ -354,7 +354,7 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
 
         self.config = config
 
-        self.rope_type = self.config.rope_parameters["rope_type"]
+        self.rope_type = self.config.rope_parameters["rope_type"] # default
         rope_init_fn: Callable = self.compute_default_rope_parameters
         if self.rope_type != "default":
             rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
@@ -363,7 +363,7 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = inv_freq
 
-        self.mrope_section = config.rope_parameters.get("mrope_section", [24, 20, 20])
+        self.mrope_section = config.rope_parameters.get("mrope_section", [24, 20, 20]) # [16, 24, 24]
 
     @staticmethod
     def compute_default_rope_parameters(
@@ -384,13 +384,13 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
             Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
             post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
         """
-        base = config.rope_parameters["rope_theta"]
+        base = config.rope_parameters["rope_theta"] # 1000000
         dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads # 64
 
         attention_factor = 1.0  # Unused in this type of RoPE
 
         # Compute the inverse frequencies
-        inv_freq = 1.0 / ( # frequency for 32 pairs
+        inv_freq = 1.0 / ( # frequency for 32 pairs. formula is 1/base^(2*i/dim). Check notion notes of ROPE
             base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
         )
         return inv_freq, attention_factor
@@ -400,16 +400,22 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
     def forward(self, x, position_ids): # x:  [2, 1024, 512] ,position_ids: [3,2,1024]
         # In contrast to other models, Qwen3VL has different position ids for the grids
         # So we expand the inv_freq to shape (3, ...)
-        if position_ids.ndim == 2:
+        if position_ids.ndim == 2: # False
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
-        inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1) # [3,2,64,1]
-        position_ids_expanded = position_ids[:, :, None, :].float()  # shape (3, bs, 1, positions) # [3,2,1,1024a]
+        # shape of self.inv_freq is [32]
+        # self.inv_freq[None, None, :, None] -> [1, 1, 32, 1]
+        # .expand(3, position_ids.shape[1], -1, 1) broadcasts the first, second dimension making it[3,2,32,1]
+        inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1) 
+        position_ids_expanded = position_ids[:, :, None, :].float()  # shape (3, bs, 1, positions) # [3,2,1,1024]
 
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):  # Force float32
+
+            # (inv_freq_expanded.float() @ position_ids_expanded.float()) -> [3,2,32,1024]
+            # transpose to [3,2,1024,32]
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
-            freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
-            emb = torch.cat((freqs, freqs), dim=-1)
+            freqs = self.apply_interleaved_mrope(freqs, self.mrope_section) # currently we laid out t,h,w angles across 3 axis. we cahnge it to return [2,1024,32]
+            emb = torch.cat((freqs, freqs), dim=-1) # concatenate to [3,2,1024,64] making it all the angels required to be rotated.
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
 
@@ -421,16 +427,28 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
         interleaved [THTHWHTHW...TT], preserving frequency continuity.
         args:
             x: (3, bs, seq_len, head_dim // 2)
-            mrope_section: (3,)
+            mrope_section: (3,) -> # [16, 24, 24]
         returns:
             x_t: (bs, seq_len, head_dim // 2)
         """
         freqs_t = freqs[0]  # just overwrite the first dimension T
-        for dim, offset in enumerate((1, 2), start=1):  # H, W
-            length = mrope_section[dim] * 3
+        for dim, offset in enumerate((1, 2), start=1):  # H, W. Iterate (1,2) in (index,elem) fashion with index starting at 1. So here ((1,1),(2,2))
+            length = mrope_section[dim] * 3 # 24*3 = 72. 
             idx = slice(offset, length, 3)
             freqs_t[..., idx] = freqs[dim, ..., idx]
-        return freqs_t
+        return freqs_t # note how its still 32 numbers
+        '''
+        we generated frequencies for 32 pairs in inv_freq . This is the frequency we want to use per pair 
+        Then we muliplied [3,2,32,1] (angles) with [3,2,1,1024] (position_ids)
+        Note how former is 3 copy of 2 copies of 32 numbers. They are identical across these axes
+        But the position ids are distinct 
+        When we multiply, a given set of 32 numbers for one axis differs from another axis purely because one 
+        is the time position id at given position
+        Another is width posision id at given posision 
+        By interleaving we are chosing in our case 11 slots in 32 to carry time axis angles for that posision 
+        11 to carry height
+        10 to carry width
+        '''
 
 
 
@@ -1134,12 +1152,13 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             attention_mask=attention_mask,
             cache_position=cache_position,
             past_key_values=past_key_values,
-            position_ids=text_position_ids,
+            position_ids=text_position_ids, # not used by our flow
         )
 
         hidden_states = inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
+        # need hidden_states only for dtype. From position ids of shape [3,2,1024] we calculate necessary angles that we want to rotate our vectors by
         position_embeddings = self.rotary_emb(hidden_states, position_ids) # tuple. each of shape [2, 1024, 64]
 
         # decoder layers
@@ -1307,7 +1326,7 @@ This delta is used during decoding (next tokens after prefill): the model builds
         vision_start_token_id = self.config.vision_start_token_id # 1
         mrope_position_deltas = [] # will store, per batch item, how far MRoPE positions extend beyond vanilla text positions (used to offset positions during decode).
         if input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
-            total_input_ids = input_ids
+            total_input_ids = input_ids # [2,1024]
             if attention_mask is None: # Use the provided attention_mask, else treat everything as valid. we do have it so yay
                 attention_mask = torch.ones_like(total_input_ids)
             position_ids = torch.ones(
@@ -1720,13 +1739,13 @@ Sequence length > 1 and this is the first time (no past keys or cache_position=0
         outputs = self.language_model(
             input_ids=None,
             position_ids=position_ids, # shape [3, 2, 1024]
-            attention_mask=attention_mask, # shape [2, 2024]
+            attention_mask=attention_mask, # shape [1, 2024]
             past_key_values=past_key_values, # can be assumed None for now and covered in kv cache
             inputs_embeds=inputs_embeds, # these are already fused text+visual embeddings (placeholders replaced). # [2 , 1024, 512] 
             cache_position=cache_position, # None
             visual_pos_masks=visual_pos_masks, #[2, 1024] -> telling where visual tokens are 
             deepstack_visual_embeds=deepstack_visual_embeds, # [3, 8, 512] visual embeds from between layers.
-            **kwargs, # kwargs['shift_labels'] is [2,1024]
+            **kwargs, # kwargs['shift_labels'] is [2,1024] # unused
         )
 
         return Qwen3VLModelOutputWithPast(
