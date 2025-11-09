@@ -283,7 +283,7 @@ def _ignore_bidirectional_mask_sdpa(padding_mask: Optional[torch.Tensor]) -> boo
 
 
 def sdpa_mask_recent_torch(
-    batch_size: int,
+    batch_size: int, # 2
     cache_position: torch.Tensor,
     kv_length: int,
     kv_offset: int = 0,
@@ -763,7 +763,7 @@ def _preprocess_mask_arguments(
             An offset to indicate at which first position the key and values states will refer to.
     """
     # If the mask is already 4D, simply return as-is (it was already prepared, or it is custom)
-    if isinstance(attention_mask, (torch.Tensor, BlockMask)) and len(attention_mask.shape) == 4:
+    if isinstance(attention_mask, (torch.Tensor, BlockMask)) and len(attention_mask.shape) == 4: # not true
         return True, attention_mask, None, None, None
 
     # For TGI/vLLM backends, or other custom attention without equivalent mask creation: we don't need a mask!
@@ -771,7 +771,7 @@ def _preprocess_mask_arguments(
     # full graph dynamo tracing (i.e. torch.export or compile with `fullgraph=True`) will fail on Python<3.11
     # with `torch._dynamo.exc.Unsupported: 'inline in skipfiles:Mapping.__contains__ | __contains__, skipped
     # according trace_rules.lookup SKIP_DIRS'` -- can be removed when we require Python>=3.11
-    if config._attn_implementation not in ALL_MASK_ATTENTION_FUNCTIONS._global_mapping:
+    if config._attn_implementation not in ALL_MASK_ATTENTION_FUNCTIONS._global_mapping: # sdpa is present
         return True, None, None, None, None
 
     # Move the mask to correct device, and potentially switch dtype for efficiency
@@ -783,12 +783,12 @@ def _preprocess_mask_arguments(
         kv_length, kv_offset = past_key_values.get_mask_sizes(cache_position, layer_idx)
     # Otherwise, the sizes are simply the input sizes
     else:
-        kv_length, kv_offset = input_embeds.shape[1], 0
+        kv_length, kv_offset = input_embeds.shape[1], 0 # this is our branch
 
     # We check the position_ids for potential packed sequence format (only if the 2D attention mask is explicitly None,
     # and we don't have past_key_values, i.e. generally a training setup)
     packed_sequence_mask = None
-    if position_ids is not None and attention_mask is None and past_key_values is None:
+    if position_ids is not None and attention_mask is None and past_key_values is None: # attention mask is not none
         batch_size = input_embeds.shape[0]
         # The position ids are sometimes just unsqueezed, without being expanded
         if batch_size != position_ids.shape[0]:
@@ -805,10 +805,95 @@ def create_causal_mask(
     cache_position: torch.Tensor,
     past_key_values: Optional[Cache],
     position_ids: Optional[torch.Tensor] = None,
-    or_mask_function: Optional[Callable] = None,
-    and_mask_function: Optional[Callable] = None,
+    or_mask_function: Optional[Callable] = None, # None
+    and_mask_function: Optional[Callable] = None, # None
 ) -> Optional[Union[torch.Tensor, BlockMask]]:
     """
+
+    Returns [batch, 1, q_len, k_len]
+
+    The attention scores for one layer are usually shaped like:
+
+[batch, num_heads, q_len, k_len]
+
+But the mask is usually the same for all heads (all heads obey the same causal / padding rules), so they make the mask:
+
+[batch, 1, q_len, k_len]
+
+Then it gets broadcast over num_heads:
+
+[batch, num_heads, q_len, k_len]
+
+Yep, that’s exactly the right mental model 👍
+
+Base case (no padding, no fancy rules)
+
+If:
+
+no padding,
+
+no packed sequences,
+
+no special image/video rules,
+
+no extra or_mask_function / and_mask_function,
+
+then the logical content of the mask is just a lower-triangular matrix along the [q_len, k_len] axes:
+
+query token i can attend to key tokens 0..i
+
+cannot attend to j > i
+
+So for each batch item, the mask over [q_len, k_len] is basically:
+
+1 0 0 0
+1 1 0 0
+1 1 1 0
+1 1 1 1
+
+
+(plus a broadcast over the heads → [batch, 1, q_len, k_len]).
+
+Sometimes this is explicit (a tensor with 0 / -inf), sometimes it’s implicit (is_causal=True flag), but conceptually: lower-tri.
+
+When padding / extra rules come in
+
+On top of that causal lower-tri structure, they apply:
+
+Padding mask
+
+If some positions are PAD, those columns (and sometimes rows) get zeroed out / set to -∞ so nobody attends to padding.
+
+Effect: some entries in the lower triangle become blocked.
+
+Sequence packing mask
+
+If you pack multiple sequences together, the packed mask ensures:
+
+tokens from one sequence cannot attend to tokens from another,
+
+even if causal alone would allow it.
+
+Effect: lower-tri gets cut into blocks along the diagonal; off-block entries = blocked.
+
+Custom rules via or_mask_function / and_mask_function
+
+e.g. image tokens can see each other bidirectionally, or some region can always see everything.
+
+Effect: some entries inside or outside the triangle get flipped from allowed → blocked or blocked → allowed depending on OR/AND logic.
+
+So:
+
+Base: lower-triangular causal structure
+Then: mask = causal ▸ combined with padding ▸ combined with packing ▸ combined with extra rules
+
+Your summary is spot on:
+
+No padding / rules → “just a tril matrix” (conceptually).
+
+With padding / extra rules → that tril matrix is slightly modified (or sometimes heavily modified) at certain positions.
+
+
     Create a standard causal mask based on the attention implementation used (stored in the config). If `past_key_values`
     has an hybrid cache structure, this function will return the mask corresponding to one of the "full_attention" layers (to align
     to what is needed in the `modeling_xxx.py` files).
@@ -839,16 +924,21 @@ def create_causal_mask(
     if hasattr(past_key_values, "is_sliding") and False in past_key_values.is_sliding:
         layer_idx = past_key_values.is_sliding.index(False)
     else:
-        layer_idx = 0
+        layer_idx = 0 # in our case this is true
 
+    #kv_length = 1024
+    # kv_offset = 0
+    # packed_sequence_mask = None
+    # early_exit = false
+    # attention_mask is as is
     early_exit, attention_mask, packed_sequence_mask, kv_length, kv_offset = _preprocess_mask_arguments(
         config, input_embeds, attention_mask, cache_position, past_key_values, position_ids, layer_idx
     )
     if early_exit:
         return attention_mask
 
-    batch_size, dtype = input_embeds.shape[0], input_embeds.dtype
-    mask_factory_function = causal_mask_function
+    batch_size, dtype = input_embeds.shape[0], input_embeds.dtype # 2, fp32/bf16
+    mask_factory_function = causal_mask_function # basic  return kv_idx <= q_idx
     mask_interface = ALL_MASK_ATTENTION_FUNCTIONS[config._attn_implementation]
 
     # Do not allow skip if we are compiling (this is to match BC)

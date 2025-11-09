@@ -41,14 +41,14 @@ def use_gqa_in_sdpa(attention_mask: Optional[torch.Tensor], key: torch.Tensor) -
 
 def sdpa_attention_forward(
     module: torch.nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    dropout: float = 0.0,
-    scaling: Optional[float] = None,
-    is_causal: Optional[bool] = None,
-    **kwargs,
+    query: torch.Tensor, ## [2, 8, 1024, 64]
+    key: torch.Tensor, # same as query
+    value: torch.Tensor,# same as query
+    attention_mask: Optional[torch.Tensor], # [2, 1, 1024, 1024]
+    dropout: float = 0.0,# 0
+    scaling: Optional[float] = None, # 0.125
+    is_causal: Optional[bool] = None,  # None
+    **kwargs, # position_ids: [2,1024]
 ) -> tuple[torch.Tensor, None]:
     if kwargs.get("output_attentions", False):
         logger.warning_once(
@@ -67,7 +67,7 @@ def sdpa_attention_forward(
         attention_mask = attention_mask[:, :, :, : key.shape[-2]]
 
     # Instead of relying on the value set in the module directly, we use the is_causal passed in kwargs if it is presented
-    is_causal = is_causal if is_causal is not None else getattr(module, "is_causal", True)
+    is_causal = is_causal if is_causal is not None else getattr(module, "is_causal", True)# some optimization. doesn't matter for us it is false
 
     # SDPA's Flash Attention (and cuDNN) kernels rely on the `is_causal` flag. However, there are certain conditions:
     # - Not in decoding phase (otherwise we want full attention on the single query token)
@@ -79,22 +79,22 @@ def sdpa_attention_forward(
     #   full graph options. Otherwise, dynamic shapes are prevented from compiling.
     # - It is important to check first for the shape, otherwise compile will fail with
     #   `argument 'is_causal' must be bool, not SymBool`.
-    is_causal = query.shape[2] > 1 and attention_mask is None and is_causal
+    is_causal = query.shape[2] > 1 and attention_mask is None and is_causal  # same
 
     # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
     # We convert it to a bool for the SDPA kernel that only accepts bools.
-    if torch.jit.is_tracing() and isinstance(is_causal, torch.Tensor):
+    if torch.jit.is_tracing() and isinstance(is_causal, torch.Tensor): # skip
         is_causal = is_causal.item()
 
     # When `is_causal = False` and the `attention_mask` is not of boolean type, the Ascend NPU's SDPA interface cannot utilize the FlashAttentionScore operator，
     # and falls back to small-operator concatenation. To invoke the FlashAttentionScore, the attention_mask must be converted to boolean type.
     # This adaptation ensures the `attention_mask` meets the requirement for using FlashAttentionScore.
-    if _is_torch_npu_available:
+    if _is_torch_npu_available: # skip
         if attention_mask is not None and attention_mask.dtype != torch.bool:
             # Convert to boolean type, making sdpa to force call FlashAttentionScore to improve performance.
             attention_mask = torch.logical_not(attention_mask.bool()).to(query.device)
 
-    attn_output = torch.nn.functional.scaled_dot_product_attention(
+    attn_output = torch.nn.functional.scaled_dot_product_attention( # shape [2,8,1024,64]
         query,
         key,
         value,
@@ -104,6 +104,6 @@ def sdpa_attention_forward(
         is_causal=is_causal,
         **sdpa_kwargs,
     )
-    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.transpose(1, 2).contiguous() # shape [2,1024,8,64]
 
     return attn_output, None

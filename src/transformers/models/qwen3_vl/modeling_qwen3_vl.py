@@ -385,25 +385,25 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
             post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
         """
         base = config.rope_parameters["rope_theta"]
-        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads # 64
 
         attention_factor = 1.0  # Unused in this type of RoPE
 
         # Compute the inverse frequencies
-        inv_freq = 1.0 / (
+        inv_freq = 1.0 / ( # frequency for 32 pairs
             base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
         )
         return inv_freq, attention_factor
 
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
-    def forward(self, x, position_ids):
+    def forward(self, x, position_ids): # x:  [2, 1024, 512] ,position_ids: [3,2,1024]
         # In contrast to other models, Qwen3VL has different position ids for the grids
         # So we expand the inv_freq to shape (3, ...)
         if position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
-        inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
-        position_ids_expanded = position_ids[:, :, None, :].float()  # shape (3, bs, 1, positions)
+        inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1) # [3,2,64,1]
+        position_ids_expanded = position_ids[:, :, None, :].float()  # shape (3, bs, 1, positions) # [3,2,1,1024a]
 
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):  # Force float32
@@ -433,6 +433,10 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
         return freqs_t
 
 
+
+'''
+“if there is an optimized kernel for an RMSNorm forward pass (e.g., fused CUDA/Triton implementation) available from some hub, use that implementation under the hood”
+'''
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3VLTextRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
@@ -440,10 +444,23 @@ class Qwen3VLTextRMSNorm(nn.Module):
         Qwen3VLTextRMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.weight = nn.Parameter(torch.ones(hidden_size)) #512
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        '''
+        Cast input to float32 for safe math.
+
+Compute RMS across the hidden dimension: sqrt(mean(x²)).
+
+Divide the vector by its RMS → normalized to have RMS ~ 1.
+
+Multiply by a learnable per-dimension scale vector weight (γ).
+
+Cast back to original dtype.
+
+The decorator allows swapping in a fused/optimized kernel for the forward when available.
+        '''
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -455,7 +472,15 @@ class Qwen3VLTextRMSNorm(nn.Module):
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
+    """
+    
+    q: projected and normalized q : # [2, 8, 1024, 64]
+    same for k
+    cos is [2, 1024, 64] so is sin
+    unsqueezed at 1 they are [2,1,1024,64] so they can be broadcasted
+    Both are now rotated and sent back 
+    
+    Applies Rotary Position Embedding to the query and key tensors.
 
     Args:
         q (`torch.Tensor`): The query tensor.
@@ -489,14 +514,14 @@ class Qwen3VLTextAttention(nn.Module):
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads) # 64
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
         self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias # mostly 512 x 512
         )
         self.k_proj = nn.Linear(
             config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
@@ -514,21 +539,23 @@ class Qwen3VLTextAttention(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
+        hidden_states: torch.Tensor, # [2,1024, 512]
+        position_embeddings: tuple[torch.Tensor, torch.Tensor], # [2, 1024, 64] each tuple
+        attention_mask: Optional[torch.Tensor], # [2, 1, 1024, 1024]
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
+        **kwargs: Unpack[FlashAttentionKwargs],  # position_ids: [2,1024] unused.
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
+        input_shape = hidden_states.shape[:-1] # [2, 1024]
+        hidden_shape = (*input_shape, -1, self.head_dim) # [2, 1024, -1, 64]
 
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # self.q_proj(hidden_states) results in [2,1024,512]
+        # self.q_proj(hidden_states).view(hidden_shape) results in [2, 1024, 8, 64] as 8*64 is 512
+        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2) # [2, 8, 1024, 64]
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)# [2, 8, 1024, 64]
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)# [2, 8, 1024, 64]
 
-        cos, sin = position_embeddings
+        cos, sin = position_embeddings# [2, 1024, 64] each tuple
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
@@ -540,19 +567,21 @@ class Qwen3VLTextAttention(nn.Module):
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        attn_output, attn_weights = attention_interface(
+        attn_output, attn_weights = attention_interface( # sdpa
             self,
             query_states,
             key_states,
             value_states,
             attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
+            dropout=0.0 if not self.training else self.attention_dropout, # 0 for our case
+            scaling=self.scaling, # 0.125
+            **kwargs, # position_ids: [2,1024] unused.
         )
 
+        # attn_output of shape [2, 8, 1024, 64] reshaped here to [2, 1024, 512]
+        # attn_weights for us is none
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
+        attn_output = self.o_proj(attn_output) # same shape post projection
         return attn_output, attn_weights
 
 
@@ -568,6 +597,18 @@ class Qwen3VLTextMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
+        ''''
+
+        Code effectively does 
+        gate = self.act_fn(self.gate_proj(x))   # act_fn(gate_proj(x))
+        up   = self.up_proj(x)                  # up_proj(x)
+        h    = gate * up                        # elementwise product
+        y    = self.down_proj(h)                # project back
+
+        This is swiglu implementation given activation function is silu
+
+            
+        '''
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
@@ -575,32 +616,32 @@ class Qwen3VLTextMLP(nn.Module):
 class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen3VLTextConfig, layer_idx: int):
         super().__init__()
-        self.hidden_size = config.hidden_size
+        self.hidden_size = config.hidden_size # 512
 
         self.self_attn = Qwen3VLTextAttention(config=config, layer_idx=layer_idx)
 
         self.mlp = Qwen3VLTextMLP(config)
-        self.input_layernorm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps) # 512
         self.post_attention_layernorm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[TransformersKwargs],
+        hidden_states: torch.Tensor, # [2, 1024, 512]
+        position_embeddings: tuple[torch.Tensor, torch.Tensor], # tuple each of [2, 1024, 64]
+        attention_mask: Optional[torch.Tensor] = None, # [2, 1, 1024, 1024]
+        position_ids: Optional[torch.LongTensor] = None, # [2,1024] # unused
+        past_key_values: Optional[Cache] = None, # None
+        use_cache: Optional[bool] = False, # False
+        cache_position: Optional[torch.LongTensor] = None, # arange(0,1024)
+        **kwargs: Unpack[TransformersKwargs], # shift labels. [2,1024]
     ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        residual = hidden_states # [2, 1024, 512]
+        hidden_states = self.input_layernorm(hidden_states) # no change in shpae
         # Self Attention
-        hidden_states, _ = self.self_attn(
+        hidden_states, _ = self.self_attn( # no change in shape 
             hidden_states=hidden_states,
             attention_mask=attention_mask,
-            position_ids=position_ids,
+            position_ids=position_ids, # unused
             past_key_values=past_key_values,
             use_cache=use_cache,
             cache_position=cache_position,
@@ -614,7 +655,7 @@ class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        return hidden_states
+        return hidden_states # no change in shape  throughout
 
 
 @dataclass
@@ -1026,7 +1067,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
          If specified, the entries at padding_idx do not contribute to the gradient; therefore, the embedding vector at padding_idx is not updated during training, i.e. it remains as a fixed “pad”. For a newly constructed Embedding, the embedding vector at padding_idx will default to all zeros, but can be updated to another value to be used as the padding vector.
         '''
         self.layers = nn.ModuleList(
-            [Qwen3VLTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [Qwen3VLTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)] # 4
         )
         self.norm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps) # 512
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(config=config)
@@ -1103,13 +1144,13 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
 
         # decoder layers
         for layer_idx, decoder_layer in enumerate(self.layers):
-            layer_outputs = decoder_layer(
+            layer_outputs = decoder_layer( # step 1: x = x + attn(ln1(x)); step 2: x = x + mlp(ln2(x))
                 hidden_states,
                 attention_mask=attention_mask,
-                position_ids=text_position_ids,
+                position_ids=text_position_ids, # unused
                 past_key_values=past_key_values,
                 cache_position=cache_position,
-                position_embeddings=position_embeddings,
+                position_embeddings=position_embeddings, # tuple of cos and sin used for rotation 
                 **kwargs,
             )
             hidden_states = layer_outputs # [2, 1024, 512]
@@ -1124,7 +1165,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                     deepstack_visual_embeds[layer_idx], # becomes shape 8x512 because you'll find 8 visual tokens
                 )
 
-        hidden_states = self.norm(hidden_states) # norm
+        hidden_states = self.norm(hidden_states) # final norm after all text layers have been processed.
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
